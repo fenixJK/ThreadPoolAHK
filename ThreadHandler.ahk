@@ -1,48 +1,63 @@
 ﻿#Requires AutoHotkey v2.0
+/**
+ * Credits to https://github.com/Descolada/AHK-v2-libraries for mutex and semaphore class. Got too lazy to remake it.
+ */ 
+class Mutex {
+    __New(name?, initialOwner := 0, securityAttributes := 0) {
+        if !(this.ptr := DllCall("CreateMutex", "ptr", securityAttributes, "int", !!initialOwner, "ptr", IsSet(name) ? StrPtr(name) : 0))
+            throw Error("Unable to create or open the mutex", -1)
+    }
+    Lock(timeout:=0xFFFFFFFF) => DllCall("WaitForSingleObject", "ptr", this, "int", timeout, "int")
+    Release() => DllCall("ReleaseMutex", "ptr", this)
+    __Delete() => DllCall("CloseHandle", "ptr", this)
+}
+class Semaphore {
+    __New(initialCount, maximumCount?, name?, securityAttributes := 0) {
+        if IsSet(initialCount) && IsSet(maximumCount) && IsInteger(initialCount) && IsInteger(maximumCount) {
+            if !(this.ptr := DllCall("CreateSemaphore", "ptr", securityAttributes, "int", initialCount, "int", maximumCount, "ptr", IsSet(name) ? StrPtr(name) : 0))
+                throw Error("Unable to create the semaphore", -1)
+        } else if IsSet(initialCount) && initialCount is String {
+            if !(this.ptr := DllCall("OpenSemaphore", "int", maximumCount ?? 0x0002, "int", !!(name ?? 0), "ptr", IsSet(initialCount) ? StrPtr(initialCount) : 0))
+                throw Error("Unable to open the semaphore", -1)
+        } else
+            throw ValueError("Invalid parameter list!", -1)
+    }
+    Wait(timeout:=0xFFFFFFFF) => DllCall("WaitForSingleObject", "ptr", this, "int", timeout, "int")
+    Release(count := 1, &out?) => (out := DllCall("ReleaseSemaphore", "ptr", this, "int", count, "int*", &prevCount:=0), prevCount)
+    __Delete() => DllCall("CloseHandle", "ptr", this)
+}
+
 class ThreadPool {
     __New(threads := 4) {
         this.stop := false
         this.tasks := []
         this.workers := []
-        this.queueMutex := DllCall("CreateMutex", "Ptr", 0, "Int", 0, "Ptr", 0, "Ptr")
-        this.Semaphore := {
-            Ptr: DllCall(
-                "kernel32.dll\CreateSemaphore",
-                "Ptr", 0,
-                "Int", 0,
-                "Int", threads,
-                "Str", "Semaphore",
-                "Ptr"
-            ),
-            amount: threads
-        }
-        while (!this.queueMutex) {
-            this.queueMutex := DllCall("CreateMutex", "Ptr", 0, "Int", 0, "Ptr", 0, "Ptr")
-        }
-        while (!this.Semaphore.Ptr) {
-            this.Semaphore.Ptr := DllCall("kernel32.dll\CreateSemaphore", "Ptr", 0, "Int", 0, "Int", threads, "Str", "Semaphore", "Ptr")
-        }
+        this.queueMutex := Mutex("Global_Queue")
+        this.Semaphore := Semaphore(0, threads, "Semaphore")
+        this.amount := threads
         createWorker(*) {
             WorkerThread(tp, Semaphore, mutex, *) {
                 while true {
-                    if DllCall("WaitForSingleObject", "Ptr", Semaphore, "UInt", 0xFFFFFFFF) != 0
+                    if Semaphore.Wait() != 0
                         continue
-                    if DllCall("WaitForSingleObject", "Ptr", mutex, "UInt", 0xFFFFFFFF) != 0
+                    if mutex.Lock() != 0
                         continue
                     if (tp.stop)
                         break
                     if tp.tasks.Length > 0 {
                         task := this.tasks.RemoveAt(1)
-                        DllCall("ReleaseMutex", "Ptr", mutex)
+                        mutex.Release()
                         if IsSet(task) && Type(task) = "Func" {
                             task()
                         }
-                    } else DllCall("ReleaseMutex", "Ptr", mutex)
+                    } else {
+                        mutex.Release()
+                    }
                 }
             }
             worker := {}
             worker.state := "Waiting"
-            func := CallbackCreate(WorkerThread.Bind(this, this.Semaphore.Ptr, this.queueMutex))
+            func := CallbackCreate(WorkerThread.Bind(this, this.Semaphore, this.queueMutex))
             worker.threadHandle := DllCall(
                 "CreateThread",
                 "Ptr", 0,
@@ -84,16 +99,16 @@ class ThreadPool {
         if !Type(task) = "Func" { 
             throw "Invalid task"
         }
-        DllCall("WaitForSingleObject", "Ptr", this.queueMutex, "UInt", 0xFFFFFFFF)
+        this.queueMutex.Lock()
         this.tasks.Push(task)
-        DllCall("ReleaseMutex", "Ptr", this.queueMutex)
-        DllCall("ReleaseSemaphore", "Ptr", this.Semaphore.Ptr, "Int", 1, "Ptr", 0)
-        ThreadPool.HyperSleep(50, "us")
+        this.queueMutex.Release()
+        this.Semaphore.Release(1)
+        ThreadPool.HyperSleep(50, "us", 300)
     }
 
     stopThreads() {
         this.stop := true
-        DllCall("ReleaseSemaphore", "Ptr", this.Semaphore.Ptr, "Int", this.Semaphore.amount, "Ptr", 0)
+        this.Semaphore.Release(this.amount)
         for worker in this.workers {
             DllCall("WaitForSingleObject", "Ptr", worker.threadHandle, "UInt", 0xFFFFFFFF)
             DllCall("CloseHandle", "Ptr", worker.threadHandle)
@@ -102,8 +117,8 @@ class ThreadPool {
 
     __Delete() {
         this.stopThreads()
-        DllCall("CloseHandle", "Ptr", this.queueMutex)
-        DllCall("CloseHandle", "Ptr", this.Semaphore.Ptr)
+        this.queueMutex.__Delete()
+        this.Semaphore.__Delete()
     }
 
     static HyperSleep(time, unit := "ns", threshold := 30000) {
